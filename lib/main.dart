@@ -1,9 +1,21 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:isar/isar.dart';
+import 'package:path_provider/path_provider.dart';
 
-void main() {
-  runApp(const MedclockApp());
+import 'medclock_record.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final directory = await getApplicationDocumentsDirectory();
+  final isar = await Isar.open([
+    MedicationRecordSchema,
+    DoseRecordSchema,
+    AppStateRecordSchema,
+  ], directory: directory.path);
+  runApp(MedclockApp(isar: isar));
 }
 
 const _green = Color(0xFF3C9A62);
@@ -14,7 +26,9 @@ const _canvas = Color(0xFFF4F7F3);
 const _ink = Color(0xFF202A23);
 
 class MedclockApp extends StatelessWidget {
-  const MedclockApp({super.key});
+  const MedclockApp({required this.isar, super.key});
+
+  final Isar isar;
 
   @override
   Widget build(BuildContext context) {
@@ -23,6 +37,18 @@ class MedclockApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
+        fontFamily: 'Figtree',
+        textTheme: const TextTheme(
+          displayLarge: TextStyle(fontFamily: 'Inter'),
+          displayMedium: TextStyle(fontFamily: 'Inter'),
+          displaySmall: TextStyle(fontFamily: 'Inter'),
+          headlineLarge: TextStyle(fontFamily: 'Inter'),
+          headlineMedium: TextStyle(fontFamily: 'Inter'),
+          headlineSmall: TextStyle(fontFamily: 'Inter'),
+          titleLarge: TextStyle(fontFamily: 'Inter'),
+          titleMedium: TextStyle(fontFamily: 'Inter'),
+          titleSmall: TextStyle(fontFamily: 'Inter'),
+        ),
         primaryColor: _green,
         colorScheme: ColorScheme.fromSeed(
           seedColor: _green,
@@ -38,6 +64,7 @@ class MedclockApp extends StatelessWidget {
           centerTitle: false,
           toolbarHeight: 64,
           titleTextStyle: TextStyle(
+            fontFamily: 'Inter',
             fontSize: 19,
             color: Colors.white,
             fontWeight: FontWeight.w700,
@@ -77,13 +104,39 @@ class MedclockApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const MedclockHome(),
+      home: MedclockHome(isar: isar),
     );
   }
 }
 
+class _MedclockLogo extends StatelessWidget {
+  const _MedclockLogo();
+
+  @override
+  Widget build(BuildContext context) => ClipRect(
+    child: SizedBox(
+      width: 128,
+      height: 42,
+      child: OverflowBox(
+        alignment: const Alignment(0, -0.08),
+        minWidth: 260,
+        maxWidth: 260,
+        minHeight: 260,
+        maxHeight: 260,
+        child: Image.asset(
+          'assets/images/Medclock.png',
+          width: 260,
+          height: 260,
+          semanticLabel: 'Medclock',
+        ),
+      ),
+    ),
+  );
+}
+
 class Medication {
   Medication({
+    this.id,
     required this.name,
     required this.strength,
     required this.amount,
@@ -93,6 +146,7 @@ class Medication {
     this.enabled = true,
   });
 
+  int? id;
   String name;
   String strength;
   String amount;
@@ -121,6 +175,22 @@ class MedicationSettings {
   final bool showAnalogClock;
 }
 
+class DoseLog {
+  DoseLog({
+    this.id,
+    required this.name,
+    required this.takenAt,
+    required this.repeatHours,
+  });
+
+  int? id;
+  final String name;
+  final DateTime takenAt;
+  final int repeatHours;
+
+  DateTime get nextDoseAt => takenAt.add(Duration(hours: repeatHours));
+}
+
 enum ReminderAction { taken, snoozed, skipped }
 
 String formatTime(TimeOfDay time, {bool twentyFourHour = false}) {
@@ -133,8 +203,35 @@ String formatTime(TimeOfDay time, {bool twentyFourHour = false}) {
   return '$hour:$minute $period';
 }
 
+MedicationRecord _recordFromMedication(Medication medication) =>
+    MedicationRecord()
+      ..id = medication.id ?? Isar.autoIncrement
+      ..name = medication.name
+      ..strength = medication.strength
+      ..amount = medication.amount
+      ..minuteOfDay = medication.time.hour * 60 + medication.time.minute
+      ..repeat = medication.repeat
+      ..notes = medication.notes
+      ..enabled = medication.enabled;
+
+Medication _medicationFromRecord(MedicationRecord record) => Medication(
+  id: record.id,
+  name: record.name,
+  strength: record.strength,
+  amount: record.amount,
+  time: TimeOfDay(
+    hour: record.minuteOfDay ~/ 60,
+    minute: record.minuteOfDay % 60,
+  ),
+  repeat: record.repeat,
+  notes: record.notes,
+  enabled: record.enabled,
+);
+
 class MedclockHome extends StatefulWidget {
-  const MedclockHome({super.key});
+  const MedclockHome({required this.isar, super.key});
+
+  final Isar isar;
 
   @override
   State<MedclockHome> createState() => _MedclockHomeState();
@@ -143,7 +240,14 @@ class MedclockHome extends StatefulWidget {
 class _MedclockHomeState extends State<MedclockHome> {
   MedicationSettings _settings = const MedicationSettings();
   final Set<Medication> _takenToday = {};
-  final List<Medication> _medications = [
+  final List<DoseLog> _doseLogs = [];
+  final List<Medication> _medications = [];
+  Timer? _countdownTicker;
+  Timer? _doseExpiryTimer;
+  bool _loading = true;
+  bool _expiringDoseLogs = false;
+
+  List<Medication> _starterMedications() => [
     Medication(
       name: 'Vitamin D',
       strength: '1,000 IU',
@@ -172,6 +276,93 @@ class _MedclockHomeState extends State<MedclockHome> {
     ),
   ];
 
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadData());
+  }
+
+  @override
+  void dispose() {
+    _countdownTicker?.cancel();
+    _doseExpiryTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadData() async {
+    final isar = widget.isar;
+    final appState = await isar.appStateRecords.get(0);
+    var medicationRecords = await isar.medicationRecords.where().findAll();
+    if (appState == null) {
+      final starterMedications = medicationRecords.isEmpty
+          ? _starterMedications()
+          : <Medication>[];
+      final starterRecords = starterMedications
+          .map(_recordFromMedication)
+          .toList();
+      await isar.writeTxn(() async {
+        if (starterRecords.isNotEmpty) {
+          await isar.medicationRecords.putAll(starterRecords);
+        }
+        await isar.appStateRecords.put(
+          AppStateRecord()
+            ..starterMedicationsLoaded = true
+            ..reminderSound = 'Gentle bell'
+            ..snoozeMinutes = 10
+            ..vibrate = true
+            ..twentyFourHour = false
+            ..showAnalogClock = true,
+        );
+      });
+      medicationRecords = await isar.medicationRecords.where().findAll();
+    }
+    final savedSettings = await isar.appStateRecords.get(0);
+    if (savedSettings == null) {
+      throw StateError('Medclock settings were not initialized.');
+    }
+
+    final doseRecords = await isar.doseRecords.where().findAll();
+    final now = DateTime.now();
+    final activeDoseRecords = doseRecords
+        .where((record) => record.nextDoseAt.isAfter(now))
+        .toList();
+    final expiredIds = doseRecords
+        .where((record) => !record.nextDoseAt.isAfter(now))
+        .map((record) => record.id)
+        .toList();
+    if (expiredIds.isNotEmpty) {
+      await isar.writeTxn(() => isar.doseRecords.deleteAll(expiredIds));
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _medications
+        ..clear()
+        ..addAll(medicationRecords.map(_medicationFromRecord));
+      _doseLogs
+        ..clear()
+        ..addAll(
+          activeDoseRecords.map(
+            (record) => DoseLog(
+              id: record.id,
+              name: record.name,
+              takenAt: record.takenAt,
+              repeatHours: record.repeatHours,
+            ),
+          ),
+        );
+      _settings = MedicationSettings(
+        reminderSound: savedSettings.reminderSound,
+        snoozeMinutes: savedSettings.snoozeMinutes,
+        vibrate: savedSettings.vibrate,
+        twentyFourHour: savedSettings.twentyFourHour,
+        showAnalogClock: savedSettings.showAnalogClock,
+      );
+      _loading = false;
+    });
+    _syncCountdownTicker();
+  }
+
   Future<void> _editMedication({Medication? medication}) async {
     final result = await Navigator.of(context).push<Medication>(
       MaterialPageRoute(
@@ -179,28 +370,50 @@ class _MedclockHomeState extends State<MedclockHome> {
           medication: medication,
           onDelete: medication == null
               ? null
-              : () {
-                  setState(() => _medications.remove(medication));
-                  Navigator.of(context).pop();
-                },
+              : () => _deleteMedication(medication),
         ),
       ),
     );
     if (result == null || !mounted) return;
+    result.id = medication?.id;
+    final record = _recordFromMedication(result);
+    await widget.isar.writeTxn(() => widget.isar.medicationRecords.put(record));
+    result.id = record.id;
+    if (!mounted) return;
     setState(() {
       if (medication == null) {
         _medications.add(result);
       } else {
-        medication
-          ..name = result.name
-          ..strength = result.strength
-          ..amount = result.amount
-          ..time = result.time
-          ..repeat = result.repeat
-          ..notes = result.notes
-          ..enabled = result.enabled;
+        final index = _medications.indexOf(medication);
+        if (index != -1) _medications[index] = result;
       }
     });
+  }
+
+  Future<void> _deleteMedication(Medication medication) async {
+    final id = medication.id;
+    if (id != null) {
+      await widget.isar.writeTxn(
+        () => widget.isar.medicationRecords.delete(id),
+      );
+    }
+    if (!mounted) return;
+    setState(() {
+      _medications.remove(medication);
+      _takenToday.remove(medication);
+    });
+  }
+
+  Future<void> _persistMedicationChanges() async {
+    final records = _medications.map(_recordFromMedication).toList();
+    await widget.isar.writeTxn(
+      () => widget.isar.medicationRecords.putAll(records),
+    );
+    if (!mounted) return;
+    for (var index = 0; index < _medications.length; index++) {
+      _medications[index].id = records[index].id;
+    }
+    setState(() {});
   }
 
   Future<void> _openReminder(Medication medication) async {
@@ -229,13 +442,102 @@ class _MedclockHomeState extends State<MedclockHome> {
     final settings = await Navigator.of(context).push<MedicationSettings>(
       MaterialPageRoute(builder: (_) => SettingsPage(settings: _settings)),
     );
-    if (settings != null && mounted) setState(() => _settings = settings);
+    if (settings == null || !mounted) return;
+    final savedSettings = await widget.isar.appStateRecords.get(0);
+    if (savedSettings == null) {
+      throw StateError('Medclock settings were not initialized.');
+    }
+    savedSettings
+      ..reminderSound = settings.reminderSound
+      ..snoozeMinutes = settings.snoozeMinutes
+      ..vibrate = settings.vibrate
+      ..twentyFourHour = settings.twentyFourHour
+      ..showAnalogClock = settings.showAnalogClock;
+    await widget.isar.writeTxn(
+      () => widget.isar.appStateRecords.put(savedSettings),
+    );
+    if (mounted) setState(() => _settings = settings);
+  }
+
+  Future<void> _logDose(DoseLog log) async {
+    final record = DoseRecord()
+      ..name = log.name
+      ..takenAt = log.takenAt
+      ..repeatHours = log.repeatHours;
+    await widget.isar.writeTxn(() => widget.isar.doseRecords.put(record));
+    log.id = record.id;
+    if (!mounted) return;
+    setState(() {
+      _doseLogs.insert(0, log);
+    });
+    _syncCountdownTicker();
+  }
+
+  Future<void> _startDoseTimer() async {
+    await _showDoseLogDialog(context, _logDose);
+  }
+
+  void _syncCountdownTicker() {
+    _countdownTicker?.cancel();
+    _doseExpiryTimer?.cancel();
+    if (_doseLogs.isEmpty) {
+      _countdownTicker = null;
+      _doseExpiryTimer = null;
+    } else {
+      _countdownTicker = Timer.periodic(
+        const Duration(minutes: 1),
+        (_) => _refreshDoseTimers(),
+      );
+      final nextExpiry = _doseLogs
+          .map((log) => log.nextDoseAt)
+          .reduce((first, second) => first.isBefore(second) ? first : second);
+      final untilExpiry = nextExpiry.difference(DateTime.now());
+      _doseExpiryTimer = Timer(
+        untilExpiry.isNegative ? Duration.zero : untilExpiry,
+        _refreshDoseTimers,
+      );
+    }
+  }
+
+  Future<void> _refreshDoseTimers() async {
+    if (_expiringDoseLogs) return;
+    final now = DateTime.now();
+    final expired = _doseLogs
+        .where((log) => !log.nextDoseAt.isAfter(now))
+        .toList();
+    if (expired.isEmpty) {
+      if (mounted) {
+        setState(() {});
+        _syncCountdownTicker();
+      }
+      return;
+    }
+
+    _expiringDoseLogs = true;
+    try {
+      final ids = expired.map((log) => log.id).whereType<int>().toList();
+      if (ids.isNotEmpty) {
+        await widget.isar.writeTxn(
+          () => widget.isar.doseRecords.deleteAll(ids),
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _doseLogs.removeWhere(expired.contains);
+      });
+      _syncCountdownTicker();
+    } finally {
+      _expiringDoseLogs = false;
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
     return DefaultTabController(
-      length: 2,
+      length: 3,
       child: Builder(
         builder: (context) {
           final tabs = DefaultTabController.of(context);
@@ -243,10 +545,10 @@ class _MedclockHomeState extends State<MedclockHome> {
             appBar: AppBar(
               leading: IconButton(
                 tooltip: 'Settings',
-                icon: const Icon(Icons.menu, size: 20),
+                icon: const Icon(Icons.settings, size: 20),
                 onPressed: _openSettings,
               ),
-              title: const Text('medclock'),
+              title: const _MedclockLogo(),
               actions: [
                 if (tabs.index == 1)
                   IconButton(
@@ -260,7 +562,7 @@ class _MedclockHomeState extends State<MedclockHome> {
                 else
                   IconButton(
                     tooltip: 'More options',
-                    icon: const Icon(Icons.more_vert, size: 20),
+                    icon: const Icon(Icons.volunteer_activism, size: 20),
                     onPressed: _openSettings,
                   ),
               ],
@@ -281,6 +583,7 @@ class _MedclockHomeState extends State<MedclockHome> {
                 tabs: const [
                   Tab(text: 'TODAY'),
                   Tab(text: 'MEDICATIONS'),
+                  Tab(text: 'TIMERS'),
                 ],
               ),
             ),
@@ -298,19 +601,140 @@ class _MedclockHomeState extends State<MedclockHome> {
                   twentyFourHour: _settings.twentyFourHour,
                   onEdit: (medication) =>
                       _editMedication(medication: medication),
-                  onChanged: () => setState(() {}),
+                  onChanged: _persistMedicationChanges,
                 ),
+                MedicineTimersPage(doseLogs: _doseLogs, onLogDose: _logDose),
               ],
             ),
             floatingActionButton: FloatingActionButton(
-              tooltip: 'Add medication',
+              tooltip: tabs.index == 2
+                  ? 'Start medicine timer'
+                  : 'Add medication',
               mini: true,
-              onPressed: () => _editMedication(),
-              child: const Icon(Icons.add),
+              onPressed: tabs.index == 2
+                  ? _startDoseTimer
+                  : () => _editMedication(),
+              child: Icon(tabs.index == 2 ? Icons.timer_outlined : Icons.add),
             ),
           );
         },
       ),
+    );
+  }
+}
+
+class MedicineTimersPage extends StatelessWidget {
+  const MedicineTimersPage({
+    required this.doseLogs,
+    required this.onLogDose,
+    super.key,
+  });
+
+  final List<DoseLog> doseLogs;
+  final Future<void> Function(DoseLog) onLogDose;
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final nextDose = _nextDoseSummary(doseLogs, now);
+    final sorted = doseLogs.toList()
+      ..sort((a, b) => a.nextDoseAt.compareTo(b.nextDoseAt));
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(18, 20, 18, 100),
+      children: [
+        const Text(
+          'Medicine timers',
+          style: TextStyle(
+            fontFamily: 'Inter',
+            fontSize: 21,
+            color: _ink,
+            fontWeight: FontWeight.w700,
+            letterSpacing: -0.5,
+          ),
+        ),
+        const SizedBox(height: 4),
+        const Text(
+          'Track when you can take each medicine again.',
+          style: TextStyle(fontSize: 13, color: _muted),
+        ),
+        const SizedBox(height: 18),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: _lightGreen,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Next timer ends in',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: _darkGreen,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                nextDose.label,
+                style: const TextStyle(
+                  fontSize: 26,
+                  color: _ink,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -0.6,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 22),
+        if (sorted.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(18),
+            ),
+            child: const Column(
+              children: [
+                Icon(Icons.timer_outlined, size: 34, color: _muted),
+                SizedBox(height: 8),
+                Text(
+                  'No active medicine timers',
+                  style: TextStyle(color: _muted),
+                ),
+              ],
+            ),
+          )
+        else
+          for (var index = 0; index < sorted.length; index++) ...[
+            if (index > 0) const SizedBox(height: 10),
+            _DoseTimerCard(log: sorted[index], now: now),
+          ],
+        const SizedBox(height: 16),
+        ElevatedButton.icon(
+          onPressed: () => _showDoseLogDialog(context, onLogDose),
+          icon: const Icon(Icons.add_circle_outline, size: 18),
+          label: const Text('I took medicine'),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: _darkGreen,
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        const Text(
+          'This timer is separate from scheduled reminders. Follow your '
+          'prescription or your healthcare professional’s instructions.',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 11, color: _muted),
+        ),
+      ],
     );
   }
 }
@@ -339,28 +763,18 @@ class TodayPage extends StatelessWidget {
       ..sort((a, b) => _minutes(a.time).compareTo(_minutes(b.time)));
 
     final takenCount = takenToday.intersection(sorted.toSet()).length;
-
     return ListView(
       padding: const EdgeInsets.fromLTRB(18, 20, 18, 100),
       children: [
-        Text(
-          'A little care, every day.',
-          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-            color: _ink,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.6,
-          ),
-        ),
-        const SizedBox(height: 4),
         Text(date, style: const TextStyle(fontSize: 13, color: _muted)),
         const SizedBox(height: 18),
         Container(
-          padding: const EdgeInsets.all(18),
+          padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             color: _lightGreen,
             borderRadius: BorderRadius.circular(24),
           ),
-          child: Row(
+          child: Column(
             children: [
               if (showAnalogClock) ...[
                 Container(
@@ -373,54 +787,29 @@ class TodayPage extends StatelessWidget {
                   padding: const EdgeInsets.all(8),
                   child: CustomPaint(painter: _ClockPainter(now: now)),
                 ),
-                const SizedBox(width: 18),
+                const SizedBox(height: 8),
               ],
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'RIGHT NOW',
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: _darkGreen,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1.1,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      formatTime(
-                        TimeOfDay.fromDateTime(now),
-                        twentyFourHour: twentyFourHour,
-                      ),
-                      style: const TextStyle(
-                        fontSize: 27,
-                        color: _ink,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: -0.8,
-                      ),
-                    ),
-                    const SizedBox(height: 7),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.8),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(
-                        '$takenCount of ${sorted.length} taken',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: _darkGreen,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
+              Text(
+                formatTime(
+                  TimeOfDay.fromDateTime(now),
+                  twentyFourHour: twentyFourHour,
+                ),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 33,
+                  color: _ink,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -1.0,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '$takenCount of ${sorted.length} taken',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: _darkGreen,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
             ],
@@ -434,6 +823,7 @@ class TodayPage extends StatelessWidget {
               child: Text(
                 "Today's schedule",
                 style: TextStyle(
+                  fontFamily: 'Inter',
                   fontSize: 18,
                   color: _ink,
                   fontWeight: FontWeight.w700,
@@ -474,6 +864,174 @@ class TodayPage extends StatelessWidget {
             ),
           ],
       ],
+    );
+  }
+}
+
+Future<void> _showDoseLogDialog(
+  BuildContext context,
+  Future<void> Function(DoseLog) onLogDose,
+) async {
+  final controller = TextEditingController();
+  var intervalHours = 6;
+  final result = await showDialog<DoseLog>(
+    context: context,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (innerContext, setDialogState) => AlertDialog(
+        title: const Text('I took medicine'),
+        content: SizedBox(
+          width: 320,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: controller,
+                decoration: const InputDecoration(
+                  hintText: 'Medicine name',
+                  labelText: 'Medicine name',
+                ),
+              ),
+              const SizedBox(height: 14),
+              DropdownButtonFormField<int>(
+                initialValue: intervalHours,
+                decoration: const InputDecoration(labelText: 'Remind me after'),
+                items: const [
+                  DropdownMenuItem(value: 4, child: Text('4 hours')),
+                  DropdownMenuItem(value: 6, child: Text('6 hours')),
+                  DropdownMenuItem(value: 8, child: Text('8 hours')),
+                  DropdownMenuItem(value: 12, child: Text('12 hours')),
+                  DropdownMenuItem(value: 24, child: Text('24 hours')),
+                ],
+                onChanged: (value) => setDialogState(() {
+                  intervalHours = value ?? 6;
+                }),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('CANCEL'),
+          ),
+          TextButton(
+            onPressed: () {
+              final name = controller.text.trim();
+              if (name.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Enter a medicine name')),
+                );
+                return;
+              }
+              Navigator.of(dialogContext).pop(
+                DoseLog(
+                  name: name,
+                  takenAt: DateTime.now(),
+                  repeatHours: intervalHours,
+                ),
+              );
+            },
+            child: const Text('START TIMER'),
+          ),
+        ],
+      ),
+    ),
+  );
+  controller.dispose();
+  if (result != null) await onLogDose(result);
+}
+
+class _DoseSummary {
+  const _DoseSummary({required this.label, required this.remaining});
+
+  final String label;
+  final Duration remaining;
+}
+
+_DoseSummary _nextDoseSummary(List<DoseLog> doseLogs, DateTime now) {
+  if (doseLogs.isEmpty) {
+    return const _DoseSummary(
+      label: 'No timer running',
+      remaining: Duration.zero,
+    );
+  }
+
+  final upcoming = doseLogs
+      .map((log) => log.nextDoseAt.difference(now))
+      .where((remaining) => !remaining.isNegative)
+      .toList();
+
+  if (upcoming.isEmpty) {
+    final next = doseLogs.reduce(
+      (a, b) => a.nextDoseAt.isBefore(b.nextDoseAt) ? a : b,
+    );
+    final remaining = next.nextDoseAt.difference(now);
+    return _DoseSummary(label: 'Ready now', remaining: remaining);
+  }
+
+  final next = upcoming.reduce((a, b) => a < b ? a : b);
+  return _DoseSummary(label: _formatCountdown(next), remaining: next);
+}
+
+String _formatCountdown(Duration remaining) {
+  if (remaining.isNegative || remaining == Duration.zero) return 'Ready now';
+
+  final totalMinutes = (remaining.inSeconds + 59) ~/ 60;
+  final hours = totalMinutes ~/ 60;
+  final minutes = totalMinutes % 60;
+  if (hours > 0) {
+    return '${hours}h ${minutes}m';
+  }
+  return '${minutes}m';
+}
+
+class _DoseTimerCard extends StatelessWidget {
+  const _DoseTimerCard({required this.log, required this.now});
+
+  final DoseLog log;
+  final DateTime now;
+
+  @override
+  Widget build(BuildContext context) {
+    final remaining = log.nextDoseAt.difference(now);
+    final availableAt = formatTime(TimeOfDay.fromDateTime(log.nextDoseAt));
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.timer_outlined, color: _darkGreen),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  log.name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    color: _ink,
+                  ),
+                ),
+                Text(
+                  'Available again at $availableAt',
+                  style: const TextStyle(fontSize: 11, color: _muted),
+                ),
+              ],
+            ),
+          ),
+          Text(
+            _formatCountdown(remaining),
+            style: const TextStyle(
+              color: _darkGreen,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -534,6 +1092,7 @@ class _ScheduleCard extends StatelessWidget {
                   Text(
                     medication.name,
                     style: const TextStyle(
+                      fontFamily: 'Inter',
                       fontSize: 14,
                       color: _ink,
                       fontWeight: FontWeight.w600,
@@ -655,6 +1214,7 @@ class MedicationListPage extends StatelessWidget {
         const Text(
           'My medications',
           style: TextStyle(
+            fontFamily: 'Inter',
             fontSize: 21,
             color: _ink,
             fontWeight: FontWeight.w700,
@@ -751,6 +1311,7 @@ class _MedicationCard extends StatelessWidget {
                   Text(
                     medication.name,
                     style: const TextStyle(
+                      fontFamily: 'Inter',
                       fontSize: 14,
                       color: _ink,
                       fontWeight: FontWeight.w600,
@@ -840,7 +1401,7 @@ class MedicationFormPage extends StatefulWidget {
   const MedicationFormPage({this.medication, this.onDelete, super.key});
 
   final Medication? medication;
-  final VoidCallback? onDelete;
+  final Future<void> Function()? onDelete;
 
   @override
   State<MedicationFormPage> createState() => _MedicationFormPageState();
@@ -920,7 +1481,10 @@ class _MedicationFormPageState extends State<MedicationFormPage> {
         ],
       ),
     );
-    if (confirmed == true && mounted) widget.onDelete?.call();
+    if (confirmed == true && mounted) {
+      await widget.onDelete?.call();
+      if (mounted) Navigator.of(context).pop();
+    }
   }
 
   @override
@@ -1107,7 +1671,10 @@ class _MedicationFormPageState extends State<MedicationFormPage> {
       dense: true,
       contentPadding: EdgeInsets.zero,
       leading: Icon(icon, size: 19, color: _darkGreen),
-      title: Text(title, style: const TextStyle(fontSize: 12)),
+      title: Text(
+        title,
+        style: const TextStyle(fontFamily: 'Inter', fontSize: 12),
+      ),
       subtitle: value == null
           ? null
           : Text(value, style: const TextStyle(fontSize: 10, color: _muted)),
@@ -1148,11 +1715,11 @@ class ReminderPage extends StatelessWidget {
           icon: const Icon(Icons.arrow_back, size: 20),
           onPressed: () => Navigator.pop(context),
         ),
-        title: const Text('medclock'),
+        title: const _MedclockLogo(),
         actions: [
           IconButton(
             tooltip: 'More options',
-            icon: const Icon(Icons.more_vert, size: 20),
+            icon: const Icon(Icons.volunteer_activism, size: 20),
             onPressed: () {},
           ),
         ],
@@ -1216,6 +1783,7 @@ class ReminderPage extends StatelessWidget {
                     Text(
                       medication.name,
                       style: const TextStyle(
+                        fontFamily: 'Inter',
                         fontSize: 20,
                         color: _ink,
                         fontWeight: FontWeight.w700,
@@ -1353,7 +1921,7 @@ class _SettingsPageState extends State<SettingsPage> {
         actions: [
           IconButton(
             tooltip: 'More options',
-            icon: const Icon(Icons.more_vert, size: 20),
+            icon: const Icon(Icons.volunteer_activism, size: 20),
             onPressed: () {},
           ),
         ],
@@ -1407,11 +1975,11 @@ class _SettingsPageState extends State<SettingsPage> {
           _SettingsHeading('About'),
           _SettingsItem(
             icon: Icons.info_outline,
-            title: 'medclock',
+            title: 'Medclock',
             subtitle:
-                'Version 1.0 · UI template\n\n'
+                'Alpha · In development\n\n'
                 'Keep track of your medication schedule. '
-                'This template does not send reminders or provide medical advice.',
+                'Fully open source and free forever!\n\n',
           ),
         ],
       ),
@@ -1464,6 +2032,7 @@ class _SettingsHeading extends StatelessWidget {
     child: Text(
       title,
       style: const TextStyle(
+        fontFamily: 'Inter',
         fontSize: 11,
         color: _darkGreen,
         fontWeight: FontWeight.w600,
@@ -1492,7 +2061,10 @@ class _SettingsItem extends StatelessWidget {
     dense: true,
     contentPadding: const EdgeInsets.symmetric(horizontal: 12),
     leading: Icon(icon, size: 18, color: _muted),
-    title: Text(title, style: const TextStyle(fontSize: 12)),
+    title: Text(
+      title,
+      style: const TextStyle(fontFamily: 'Inter', fontSize: 12),
+    ),
     subtitle: subtitle == null
         ? null
         : Text(subtitle!, style: const TextStyle(fontSize: 10, color: _muted)),
